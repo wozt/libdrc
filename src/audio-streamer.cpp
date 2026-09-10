@@ -48,9 +48,17 @@ const u32 kSamplesPerPacket = 384;
 const u32 kPacketIntervalMs = 1000 / (kSamplesPerSecond / kSamplesPerPacket);
 
 s32 GetTimestamp() {
+  // Keep the last good value: GetTsf fails while the MAC is powered down or
+  // if the adapter goes away, and returning a stale timestamp is far better
+  // than returning whatever happened to be on the stack. Only this streamer's
+  // event thread reaches this.
+  static s32 last_timestamp = 0;
   u64 tsf;
-  GetTsf(&tsf);
-  return static_cast<s32>(tsf & 0xFFFFFFFF);
+
+  if (GetTsf(&tsf) == 0) {
+    last_timestamp = static_cast<s32>(tsf & 0xFFFFFFFF);
+  }
+  return last_timestamp;
 }
 
 }  // namespace

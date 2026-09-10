@@ -23,6 +23,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <drc/types.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
@@ -92,10 +93,24 @@ int GetTsf(u64 *tsf) {
       return -1;
     }
   }
-  if (pread(fd, tsf, sizeof (*tsf), 0) != sizeof (*tsf)) {
-    perror("pread failed - GetTsf");
+  if (pread(fd, tsf, sizeof (*tsf), 0) == sizeof (*tsf)) {
+    return 0;
   }
-  return 0;
+
+  perror("pread failed - GetTsf");
+
+  // Do not return success here: *tsf has not been written, and every caller
+  // passes an uninitialized stack variable.
+  //
+  // EAGAIN means the driver is loaded but the MAC is powered down, so the
+  // counter is simply not running right now and the descriptor stays valid.
+  // Anything else (module unloaded, adapter unplugged) leaves us holding a
+  // stale descriptor, so drop it and let the next call reopen.
+  if (errno != EAGAIN) {
+    close(fd);
+    fd = -1;
+  }
+  return -1;
 }
 
 }  // namespace drc
