@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <functional>
 #include <drc/input.h>
 #include <drc/pixel-format.h>
 #include <drc/types.h>
