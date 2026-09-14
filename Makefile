@@ -7,7 +7,7 @@ ifeq ($(DEMOS),y)
 DEMOS_NAMES:=3dtest tsdraw simpleaudio
 DEMOS_SRCS:=demos/framework/framework.cpp \
             $(foreach d,$(DEMOS_NAMES),demos/$(d)/main.cpp) \
-            demos/drc_player demos/hello_drc.cpp demos/hello_drc.cpp
+            demos/drc_player.cpp demos/hello_drc.cpp
 DEMOS_BINS:=$(foreach d,$(DEMOS_NAMES),demos/$(d)/$(d)) \
            demos/drc_player demos/hello_drc
 endif
