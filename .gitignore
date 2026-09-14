@@ -8,3 +8,6 @@ demos/tsdraw/tsdraw
 demos/simpleaudio/simpleaudio
 libdrc.pc
 web/_build
+demos/assets/
+demos/drc_player
+demos/hello_drc

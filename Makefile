@@ -6,8 +6,10 @@ LIBDRC_OBJS:=$(LIBDRC_SRCS:.cpp=.o)
 ifeq ($(DEMOS),y)
 DEMOS_NAMES:=3dtest tsdraw simpleaudio
 DEMOS_SRCS:=demos/framework/framework.cpp \
-            $(foreach d,$(DEMOS_NAMES),demos/$(d)/main.cpp)
-DEMOS_BINS:=$(foreach d,$(DEMOS_NAMES),demos/$(d)/$(d))
+            $(foreach d,$(DEMOS_NAMES),demos/$(d)/main.cpp) \
+            demos/drc_player demos/hello_drc.cpp demos/hello_drc.cpp
+DEMOS_BINS:=$(foreach d,$(DEMOS_NAMES),demos/$(d)/$(d)) \
+           demos/drc_player demos/hello_drc
 endif
 
 ALL_SRCS:=$(LIBDRC_SRCS) $(DEMOS_SRCS)
@@ -32,6 +34,12 @@ demos/$(1)/$(1): demos/$(1)/main.o demos/framework/framework.o libdrc.a
 	$$(CXX) -o $$@ $$^ $$(LDFLAGS) $$(LDFLAGS_DEMOS)
 endef
 $(foreach d,$(DEMOS_NAMES),$(eval $(call build_demo,$(d))))
+
+demos/drc_player: demos/drc_player.o libdrc.a
+	$(CXX) -o $@ $^ $(LDFLAGS) -pthread
+
+demos/hello_drc: demos/hello_drc.o libdrc.a
+	$(CXX) -o $@ $^ $(LDFLAGS) -pthread
 
 %.o %.d: %.cpp Makefile.config
 	$(CXX) -MD -c $(CXXFLAGS) $< -o $(<:.cpp=.o)
