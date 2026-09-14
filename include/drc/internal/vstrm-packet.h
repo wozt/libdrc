@@ -35,6 +35,10 @@ const size_t kVstrmHeaderSize = 16;
 
 // Limit our payload size to around 1400 bytes (DRC MTU is about 1800 bytes, so
 // increasing this could help performance in the future).
+// Measured: at 1700 the GamePad stops decoding outright and asks for a
+// keyframe on every frame, so its reassembly gives out somewhere below that.
+// The ~1793-byte frames a real console sends must be its audio rather than its
+// video. At 1400 the packet rate lands within a few of the console's own.
 const size_t kMaxVstrmPayloadSize = 1400;
 
 enum class VstrmFrameRate {

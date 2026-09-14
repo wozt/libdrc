@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <drc/internal/h264-encoder.h>
 #include <drc/screen.h>
 #include <drc/types.h>
@@ -156,6 +157,11 @@ void H264Encoder::CreateEncoder() {
 
   param.analyse.inter &= ~X264_ANALYSE_PSUB16x16;
 
+  // Test knob: real video leans heavily on 4x4 intra prediction where flat
+  // synthetic content does not, and flat content is the only thing this
+  // decoder has ever been shown to handle for minutes at a time.
+  if (getenv("DRC_NO_I4X4")) param.analyse.intra &= ~X264_ANALYSE_I4x4;
+
   bool intra_refresh = kEnableIntraRefresh;
   const char* drc_keyint = getenv("DRC_KEYINT");
   if (drc_keyint) {
@@ -166,11 +172,40 @@ void H264Encoder::CreateEncoder() {
     intra_refresh = false;
     param.i_keyint_min = param.i_keyint_max = ki;
   } else if (kEnableIntraRefresh) {
-    param.i_keyint_min = 10;
-    param.i_keyint_max = 30;
+    // With intra refresh this is the period of the refresh wave, in frames:
+    // how long a full sweep of the picture takes. Shorter means more intra
+    // macroblocks per frame and a tighter restriction on motion vectors,
+    // which cannot point at a region the wave has not reached yet.
+    int period = 30;
+    if (const char* v = getenv("DRC_REFRESH")) period = atoi(v);
+    param.i_keyint_min = period < 10 ? period : 10;
+    param.i_keyint_max = period;
   } else {
     param.i_keyint_min = param.i_keyint_max = X264_KEYINT_MAX_INFINITE;
   }
+
+  // Test knobs for narrowing down which part of a heavier preset the GamePad
+  // cannot decode. "slow" breaks it on real video, "medium" does not; the
+  // differences that survive libdrc's own overrides are subme, me and trellis.
+  if (const char* v = getenv("DRC_SUBME")) param.analyse.i_subpel_refine = atoi(v);
+  if (const char* v = getenv("DRC_TRELLIS")) param.analyse.i_trellis = atoi(v);
+  if (const char* v = getenv("DRC_ME")) {
+    if (!strcmp(v, "umh")) param.analyse.i_me_method = X264_ME_UMH;
+    else if (!strcmp(v, "hex")) param.analyse.i_me_method = X264_ME_HEX;
+    else if (!strcmp(v, "esa")) param.analyse.i_me_method = X264_ME_ESA;
+  }
+  fprintf(stderr, "[enc] preset=%s subme=%d me=%d trellis=%d aq=%d\n",
+          drc_preset ? drc_preset : kEncoderQuality,
+          param.analyse.i_subpel_refine, param.analyse.i_me_method,
+          param.analyse.i_trellis, param.rc.i_aq_mode);
+
+  // The deblocking settings live in the slice header, which DRH never
+  // transmits: the GamePad filters according to whatever it assumes. Whatever
+  // x264 does here has to match, or the two reconstructions drift apart at
+  // every macroblock edge and the error accumulates frame over frame.
+  if (const char* v = getenv("DRC_DEBLOCK")) param.b_deblocking_filter = atoi(v);
+  if (const char* v = getenv("DRC_DEBLOCK_A")) param.i_deblocking_filter_alphac0 = atoi(v);
+  if (const char* v = getenv("DRC_DEBLOCK_B")) param.i_deblocking_filter_beta = atoi(v);
 
   param.i_scenecut_threshold = -1;
   param.i_csp = X264_CSP_I420;
@@ -179,7 +214,15 @@ void H264Encoder::CreateEncoder() {
   param.i_bframe = 0;
   param.i_bframe_pyramid = 0;
   param.i_frame_reference = 1;
+  if (const char* v = getenv("DRC_REF")) param.i_frame_reference = atoi(v);
+  // constrained_intra_pred lives in the PPS, which is never transmitted: the
+  // GamePad decodes with a hardcoded one. If its flag disagrees with ours then
+  // every intra macroblock next to an inter macroblock is predicted one way by
+  // us and another way by it - which lands precisely along the intra refresh
+  // boundary, as blocks that sweep across the picture with the wave.
   param.b_constrained_intra = 1;
+  if (const char* v = getenv("DRC_CONSTRAINED_INTRA"))
+    param.b_constrained_intra = atoi(v);
   param.b_intra_refresh = intra_refresh;
   param.analyse.i_weighted_pred = 0;
   param.analyse.b_weighted_bipred = 0;
@@ -193,9 +236,21 @@ void H264Encoder::CreateEncoder() {
   // ABR, or simply a different CQP value) then quantises the residual at one
   // QP while signalling another, and the GamePad decodes noise: it asks for a
   // keyframe on every frame and the picture never settles.
+  int drc_qp = 32;
+  if (const char* v = getenv("DRC_QP")) drc_qp = atoi(v);
   param.rc.i_rc_method = X264_RC_CQP;
-  param.rc.i_qp_constant = param.rc.i_qp_min = param.rc.i_qp_max = 32;
+  param.rc.i_qp_constant = param.rc.i_qp_min = param.rc.i_qp_max = drc_qp;
   param.rc.f_ip_factor = 1.0;
+
+  // The frame QP cannot move, but mb_qp_delta is transmitted, so quality can
+  // still be spent where it shows. Adaptive quantisation takes bits out of
+  // detailed areas, where blocking is masked, and puts them into flat areas
+  // and gradients, where it is not. drc-x264 keeps aq_mode alive under DRH
+  // for this; stock x264 drops it in CQP.
+  param.rc.i_aq_mode = X264_AQ_VARIANCE;
+  param.rc.f_aq_strength = 1.0f;
+  if (const char* v = getenv("DRC_AQ")) param.rc.i_aq_mode = atoi(v);
+  if (const char* v = getenv("DRC_AQ_STRENGTH")) param.rc.f_aq_strength = atof(v);
 
   // Do not output SPS/PPS/SEI/unit delimeters.
   param.b_repeat_headers = 0;

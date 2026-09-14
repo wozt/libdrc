@@ -67,6 +67,7 @@ s32 GetTimestamp() {
 void GenerateVstrmPackets(std::vector<VstrmPacket>* vstrm_packets,
                           const H264ChunkArray& chunks, u32 timestamp,
                           bool idr, bool* vstrm_inited, u16* vstrm_seqid) {
+
   // Set the init flag on the first frame ever sent.
   bool init_flag = !*vstrm_inited;
   if (init_flag) {
@@ -214,6 +215,7 @@ void VideoStreamer::InitEventsAndRun() {
   bool last_idr_valid = false;
   const int resync_interval_us = GetEnvInt("DRC_RESYNC_US", 500000, 0,
                                            5000000);
+  const bool resync_restart = GetEnvInt("DRC_RESYNC_RESTART", 1, 0, 1) != 0;
   const int tx_spread_us = GetEnvInt("DRC_TX_SPREAD_US", 11000, 0, 16000);
   std::vector<VstrmPacket> vstrm_packets;
   bool send_idr = false;
@@ -298,11 +300,18 @@ void VideoStreamer::InitEventsAndRun() {
       // sequence stays frozen forever while audio plays on. Restarting also
       // re-flags the stream as initialised and rewinds the sequence ids, which
       // is what the GamePad sees at the start of any stream.
+      // Answering a resync request means restarting the encoder, because
+      // asking for an IDR does nothing under intra refresh: x264 restarts its
+      // refresh wave and never emits another NAL_SLICE_IDR. Without this the
+      // GamePad's picture simply never comes back.
+      //
+      // It does not help a GamePad that has dropped the session rather than
+      // lost the picture - 43 restarts over 21 seconds changed nothing there,
+      // and only reassociating cleared it - but that is a different failure.
       send_idr = !vstrm_inited;
-      if (resync_requested && vstrm_inited &&
+      if (resync_restart && resync_requested && vstrm_inited &&
           (!last_idr_valid ||
            (s32)(timestamp - last_idr_ts) > resync_interval_us)) {
-        fprintf(stderr, "[drc] encoder restart (resync demande)\n");
         encoder_->Restart();
         vstrm_inited = false;
         vstrm_seqid = 0;
@@ -320,21 +329,22 @@ void VideoStreamer::InitEventsAndRun() {
         // Per-second telemetry. "resync" is the count of keyframe requests
         // from the GamePad: a healthy stream sits at 0, and anything near the
         // frame rate means it cannot decode what we send.
-        static int dbg_frames = 0, dbg_idr = 0, dbg_pkts = 0;
+        static int dbg_frames = 0, dbg_idr = 0, dbg_pkts = 0, dbg_max = 0;
         static s32 dbg_t0 = 0;
         dbg_frames++; if (frame_is_idr) dbg_idr++;
         dbg_pkts += (int)vstrm_packets.size();
+        if ((int)vstrm_packets.size() > dbg_max) dbg_max = (int)vstrm_packets.size();
         if (dbg_t0 == 0) dbg_t0 = timestamp;
         if ((s32)(timestamp - dbg_t0) > 1000000) {
           time_t wall = time(NULL);
           char hhmmss[16];
           strftime(hhmmss, sizeof hhmmss, "%H:%M:%S", localtime(&wall));
           fprintf(stderr,
-                  "[drc] %s %d frames/s, %d IDR/s, %d pkts, %d resync, "
-                  "spread=%dus, dt=%d us\n",
-                  hhmmss, dbg_frames, dbg_idr, dbg_pkts, dbg_resync,
-                  tx_spread_us, (int)(timestamp - dbg_t0));
-          dbg_frames = 0; dbg_idr = 0; dbg_pkts = 0; dbg_resync = 0;
+                  "[drc] %s %d frames/s, %d IDR/s, %d pkts, max %d/img, "
+                  "%d resync, spread=%dus\n",
+                  hhmmss, dbg_frames, dbg_idr, dbg_pkts, dbg_max, dbg_resync,
+                  tx_spread_us);
+          dbg_frames = 0; dbg_idr = 0; dbg_pkts = 0; dbg_resync = 0; dbg_max = 0;
           dbg_t0 = timestamp;
         }
       }

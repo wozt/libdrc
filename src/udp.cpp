@@ -24,6 +24,10 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <atomic>
+#include <cstdio>
+#include <ctime>
+#include <errno.h>
 #include <drc/internal/udp.h>
 #include <drc/types.h>
 #include <fcntl.h>
@@ -93,6 +97,19 @@ bool UdpClient::Send(const byte* data, size_t size) {
   if (sendto(sock_fd_, data, size, 0,
              reinterpret_cast<sockaddr*>(&dst_addr_parsed_),
              sizeof (dst_addr_parsed_)) < 0) {
+    // Every caller ignores the return value, so a send that fails here is a
+    // packet lost with nothing to show for it: it never reaches the interface
+    // counters either. Report it, rate-limited, because it looks exactly like
+    // radio loss from the far end and is not.
+    static std::atomic<long> failures(0);
+    static std::atomic<time_t> last_report(0);
+    long n = ++failures;
+    time_t now = time(NULL);
+    time_t prev = last_report.load();
+    if (now != prev && last_report.compare_exchange_strong(prev, now)) {
+      fprintf(stderr, "[udp] %ld envois echoues au total (%s)\n", n,
+              strerror(errno));
+    }
     return false;
   }
   return true;
