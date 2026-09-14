@@ -88,6 +88,15 @@ Streamer::~Streamer() {
 bool Streamer::Start() {
   msg_server_->SetReceiveCallback(
       [=](const std::vector<byte>& msg) {
+        // The GamePad sends this once per frame and never stops: captured off
+        // the air, the 3dtest demo - which it decodes perfectly - draws the
+        // same 58 messages a second as a stream it cannot decode at all. So it
+        // says "I would take a keyframe", not "I am lost".
+        //
+        // Obeying every one makes every single frame an IDR, which on real
+        // video blows the bitrate apart and freezes the picture. The streamer
+        // therefore rate-limits what it does with this (see
+        // DRC_RESYNC_US in video-streamer.cpp).
         if (msg.size() == 4 && !memcmp(msg.data(), "\1\0\0\0", 4)) {
           vid_streamer_->ResyncStream();
         }
