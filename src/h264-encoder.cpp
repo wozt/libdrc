@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <drc/internal/h264-encoder.h>
 #include <drc/screen.h>
 #include <drc/types.h>
@@ -37,7 +38,12 @@ extern "C" {
 namespace drc {
 
 namespace {
-const char* const kEncoderQuality = "slow";
+// Anything above "medium" breaks the GamePad's decoder on real video: with
+// "slow" it asks for a keyframe on every single frame (60 resync/s) and the
+// picture freezes, while "medium" and below hold a steady 0. Flat synthetic
+// content - the 3dtest demo, a test pattern - decodes fine either way, which
+// is why libdrc shipped with "slow" unnoticed.
+const char* const kEncoderQuality = "medium";
 
 // Enable intra prediction to flush decoding errors away. In practice we
 // shouldn't need this (the DRC will send libdrc a message when a frame fails
@@ -136,13 +142,25 @@ H264Encoder::~H264Encoder() {
 void H264Encoder::CreateEncoder() {
   x264_param_t param;
 
-  x264_param_default_preset(&param, kEncoderQuality, "zerolatency");
+  const char* drc_preset = getenv("DRC_PRESET");
+  x264_param_default_preset(&param,
+                            drc_preset ? drc_preset : kEncoderQuality,
+                            "zerolatency");
   param.i_width = kScreenWidth;
   param.i_height = kScreenHeight;
 
   param.analyse.inter &= ~X264_ANALYSE_PSUB16x16;
 
-  if (kEnableIntraRefresh) {
+  bool intra_refresh = kEnableIntraRefresh;
+  const char* drc_keyint = getenv("DRC_KEYINT");
+  if (drc_keyint) {
+    /* Force periodic full IDR keyframes (self-heals decoder within keyint
+     * frames on any loss); disable intra-refresh. */
+    int ki = atoi(drc_keyint);
+    if (ki < 1) ki = 30;
+    intra_refresh = false;
+    param.i_keyint_min = param.i_keyint_max = ki;
+  } else if (kEnableIntraRefresh) {
     param.i_keyint_min = 10;
     param.i_keyint_max = 30;
   } else {
@@ -157,13 +175,19 @@ void H264Encoder::CreateEncoder() {
   param.i_bframe_pyramid = 0;
   param.i_frame_reference = 1;
   param.b_constrained_intra = 1;
-  param.b_intra_refresh = kEnableIntraRefresh;
+  param.b_intra_refresh = intra_refresh;
   param.analyse.i_weighted_pred = 0;
   param.analyse.b_weighted_bipred = 0;
   param.analyse.b_transform_8x8 = 0;
   param.analyse.i_chroma_qp_offset = 0;
 
-  // Set QP = 32 for all frames.
+  // QP is fixed at 32 and nothing else works. In DRH mode x264 does not emit
+  // a slice header, so the GamePad's decoder has no way to learn the slice QP
+  // and assumes 32 - drc-x264 forces pic_init_qp to 32 and slice_qp_delta to
+  // 0 for exactly that reason. Any rate control that moves the slice QP (CRF,
+  // ABR, or simply a different CQP value) then quantises the residual at one
+  // QP while signalling another, and the GamePad decodes noise: it asks for a
+  // keyframe on every frame and the picture never settles.
   param.rc.i_rc_method = X264_RC_CQP;
   param.rc.i_qp_constant = param.rc.i_qp_min = param.rc.i_qp_max = 32;
   param.rc.f_ip_factor = 1.0;
@@ -255,6 +279,10 @@ const H264ChunkArray& H264Encoder::Encode(const std::vector<byte>& frame,
   x264_picture_t output;
 
   // Reinitialize frame-related state.
+  // Clear the chunk table: x264 fills it through a callback, and leaving the
+  // previous frame's pointers behind would resend buffers it has since
+  // overwritten.
+  chunks_.fill(std::make_tuple(nullptr, 0));
   num_chunks_encoded_ = 0;
   curr_frame_idr_ = false;
 
@@ -276,10 +304,14 @@ void H264Encoder::ProcessNalUnit(x264_nal_t* nal) {
   int mb_per_frame = ((kScreenWidth + 15) / 16) * ((kScreenHeight + 15) / 16);
   int mb_per_chunk = mb_per_frame / kH264ChunksPerFrame;
   int chunk_idx = nal->i_first_mb / mb_per_chunk;
+  if (chunk_idx < 0 || chunk_idx >= kH264ChunksPerFrame) {
+    fprintf(stderr, "[chunk] invalid chunk index: first_mb=%d idx=%d\n",
+            nal->i_first_mb, chunk_idx);
+    return;
+  }
   chunks_[chunk_idx] = std::make_tuple(nal->p_payload, nal->i_payload);
 
   num_chunks_encoded_++;
-  assert(num_chunks_encoded_ <= 5);
   if (num_chunks_encoded_ == 5) {
     curr_frame_idr_ = nal->i_ref_idc != NAL_PRIORITY_DISPOSABLE &&
                       nal->i_type == NAL_SLICE_IDR;

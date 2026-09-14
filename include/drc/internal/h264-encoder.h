@@ -50,6 +50,12 @@ class H264Encoder {
   // The returned chunk array is only valid until the next call to Encode.
   const H264ChunkArray& Encode(const std::vector<byte>& frame, bool idr);
 
+  // True if the frame returned by the last Encode() call was actually coded
+  // as an IDR. x264 also emits IDRs on its own (keyint), not just when we ask
+  // for one, and the GamePad only treats a chunk as a recovery point when the
+  // vstrm IDR flag is set - so the flag must follow the real NAL type.
+  bool CurrentFrameIsIdr() const { return curr_frame_idr_; }
+
  private:
   void ProcessNalUnit(x264_nal_t* nal);
   static void ProcessNalUnitTrampoline(x264_t* h, x264_nal_t* nal, void* arg);
