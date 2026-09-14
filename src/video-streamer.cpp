@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <drc/internal/astrm-packet.h>
 #include <drc/internal/h264-encoder.h>
 #include <drc/internal/tsf.h>
@@ -286,13 +287,25 @@ void VideoStreamer::InitEventsAndRun() {
     s32 timestamp = GetTimestamp();
     LatchOnCurrentFrame(&encoding_frame);
     if (encoding_frame.size() > 0) {
-      // Only the caller asking for it, via Streamer::ResyncStream(), forces a
-      // keyframe now - and never more than one per resync_interval_us, since
-      // a keyframe is ~25 packets where an ordinary frame is 5.
+      // The GamePad asks for a keyframe whenever it cannot decode. Answering
+      // every request makes each frame an IDR, which on real video costs more
+      // than it repairs, so requests are rate-limited to one per
+      // resync_interval_us.
+      //
+      // Answering means restarting the encoder outright. Simply asking for an
+      // IDR does nothing under intra refresh: x264 restarts its refresh wave
+      // and never emits another NAL_SLICE_IDR, so a decoder that has lost the
+      // sequence stays frozen forever while audio plays on. Restarting also
+      // re-flags the stream as initialised and rewinds the sequence ids, which
+      // is what the GamePad sees at the start of any stream.
       send_idr = !vstrm_inited;
       if (resync_requested && vstrm_inited &&
           (!last_idr_valid ||
            (s32)(timestamp - last_idr_ts) > resync_interval_us)) {
+        fprintf(stderr, "[drc] encoder restart (resync demande)\n");
+        encoder_->Restart();
+        vstrm_inited = false;
+        vstrm_seqid = 0;
         send_idr = true;
       }
       if (send_idr) { last_idr_ts = timestamp; last_idr_valid = true; }
@@ -313,11 +326,14 @@ void VideoStreamer::InitEventsAndRun() {
         dbg_pkts += (int)vstrm_packets.size();
         if (dbg_t0 == 0) dbg_t0 = timestamp;
         if ((s32)(timestamp - dbg_t0) > 1000000) {
+          time_t wall = time(NULL);
+          char hhmmss[16];
+          strftime(hhmmss, sizeof hhmmss, "%H:%M:%S", localtime(&wall));
           fprintf(stderr,
-                  "[drc] %d frames/s, %d IDR/s, %d pkts, %d resync, "
+                  "[drc] %s %d frames/s, %d IDR/s, %d pkts, %d resync, "
                   "spread=%dus, dt=%d us\n",
-                  dbg_frames, dbg_idr, dbg_pkts, dbg_resync, tx_spread_us,
-                  (int)(timestamp - dbg_t0));
+                  hhmmss, dbg_frames, dbg_idr, dbg_pkts, dbg_resync,
+                  tx_spread_us, (int)(timestamp - dbg_t0));
           dbg_frames = 0; dbg_idr = 0; dbg_pkts = 0; dbg_resync = 0;
           dbg_t0 = timestamp;
         }

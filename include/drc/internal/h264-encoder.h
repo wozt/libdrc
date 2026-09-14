@@ -56,6 +56,17 @@ class H264Encoder {
   // vstrm IDR flag is set - so the flag must follow the real NAL type.
   bool CurrentFrameIsIdr() const { return curr_frame_idr_; }
 
+  // Throw the encoder away and start a new one, so that the next Encode()
+  // really does produce an IDR.
+  //
+  // With intra refresh enabled x264 answers a forced IDR by restarting its
+  // refresh wave instead, and never emits a NAL_SLICE_IDR again after the
+  // first frame. That repairs ordinary loss, but it leaves nothing that can
+  // recover a decoder which has lost the sequence outright - the GamePad then
+  // freezes for good while audio keeps playing. A fresh encoder is the only
+  // way back.
+  void Restart();
+
  private:
   void ProcessNalUnit(x264_nal_t* nal);
   static void ProcessNalUnitTrampoline(x264_t* h, x264_nal_t* nal, void* arg);

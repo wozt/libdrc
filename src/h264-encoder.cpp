@@ -139,6 +139,11 @@ H264Encoder::~H264Encoder() {
   DestroyEncoder();
 }
 
+void H264Encoder::Restart() {
+  DestroyEncoder();
+  CreateEncoder();
+}
+
 void H264Encoder::CreateEncoder() {
   x264_param_t param;
 
