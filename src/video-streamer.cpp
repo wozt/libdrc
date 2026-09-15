@@ -23,6 +23,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <algorithm>
+#include <drc/screen.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -33,6 +34,7 @@
 #include <drc/internal/h264-encoder.h>
 #include <drc/internal/tsf.h>
 #include <drc/internal/udp.h>
+#include <algorithm>
 #include <drc/internal/video-streamer.h>
 #include <drc/internal/vstrm-packet.h>
 #include <mutex>
@@ -161,6 +163,12 @@ VideoStreamer::VideoStreamer(const std::string& vid_dst,
     : astrm_client_(new UdpClient(aud_dst)),
       vstrm_client_(new UdpClient(vid_dst)),
       encoder_(new H264Encoder()),
+      enc_idr_(false),
+      resync_wanted_(false),
+      reinit_wanted_(false),
+      sweep_wanted_(false),
+      enc_pending_(false),
+      pre_encoded_(false),
       resync_evt_(NULL) {
 }
 
@@ -191,6 +199,43 @@ void VideoStreamer::PushFrame(std::vector<byte>* frame) {
   frame_ = std::move(*frame);
 }
 
+void VideoStreamer::PushEncodedFrame(const byte* data, const size_t* sizes,
+                                     bool idr) {
+  if (!data || !sizes) {
+    return;
+  }
+  size_t total = 0;
+  for (int i = 0; i < kH264ChunksPerFrame; ++i) {
+    total += sizes[i];
+  }
+  if (total == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(enc_mutex_);
+  // Copied rather than referenced: the sender's buffer is its encoder's
+  // and is overwritten by its next frame, while this one is consumed by
+  // another thread whenever it gets there.
+  enc_frame_.assign(data, data + total);
+  for (int i = 0; i < kH264ChunksPerFrame; ++i) {
+    enc_sizes_[i] = sizes[i];
+  }
+  enc_idr_ = idr;
+  enc_pending_ = true;
+  pre_encoded_ = true;
+}
+
+void VideoStreamer::ReinitStream() {
+  reinit_wanted_ = true;
+}
+
+void VideoStreamer::RequestSweep() {
+  sweep_wanted_ = true;
+}
+
+bool VideoStreamer::TakeResyncRequest() {
+  return resync_wanted_.exchange(false);
+}
+
 void VideoStreamer::ResyncStream() {
   if (resync_evt_) {
     resync_evt_->Trigger();
@@ -200,8 +245,17 @@ void VideoStreamer::ResyncStream() {
 void VideoStreamer::InitEventsAndRun() {
   bool resync_requested = false;
   int dbg_resync = 0;
+  /* Sweeps asked for, and when the last one was: see the note beside
+   * them for why this is not the resync interval. */
+  int sweeps = 0;
+  s32 last_sweep_ts = 0;
+  bool last_sweep_valid = false;
+  const int refresh_period = GetEnvInt("DRC_REFRESH", 30, 10, 240);
   resync_evt_ = NewTriggerableEvent([&](Event*) {
     resync_requested = true;
+    // Also recorded for a caller that encodes elsewhere; harmless on
+    // the encoding path, which never reads it.
+    resync_wanted_ = true;
     dbg_resync++;
     return true;
   });
@@ -287,6 +341,97 @@ void VideoStreamer::InitEventsAndRun() {
     }
 
     s32 timestamp = GetTimestamp();
+
+    // The already-encoded path, which is not a variation on the one
+    // below but a shortcut past all of it: no latching a picture, no
+    // encoder, no restart. Whoever produced these chunks decided what
+    // they are, including whether this frame is a recovery point.
+    if (pre_encoded_) {
+      std::vector<byte> chunk_bytes;
+      size_t chunk_sizes[kH264ChunksPerFrame];
+      bool have = false;
+      bool is_idr = false;
+      {
+        std::lock_guard<std::mutex> lk(enc_mutex_);
+        if (enc_pending_) {
+          chunk_bytes.swap(enc_frame_);
+          for (int i = 0; i < kH264ChunksPerFrame; ++i) {
+            chunk_sizes[i] = enc_sizes_[i];
+          }
+          is_idr = enc_idr_;
+          enc_pending_ = false;
+          have = true;
+        }
+      }
+      if (have) {
+        H264ChunkArray chunks;
+        const byte* at = chunk_bytes.data();
+        for (int i = 0; i < kH264ChunksPerFrame; ++i) {
+          chunks[i] = std::make_tuple(at, chunk_sizes[i]);
+          at += chunk_sizes[i];
+        }
+        // EVERY IDR re-initialises the stream, not just the first.
+        //
+        // On the encoding path a recovery point is produced by throwing
+        // the encoder away, and that path rewinds vstrm_inited and the
+        // sequence ids with it -- because a fresh encoder restarts its
+        // frame numbering, and a packetiser still counting from before
+        // hands the GamePad an IDR that does not line up with what it
+        // is told. Here the encoder is in another process and does
+        // exactly the same thing, so this has to follow.
+        //
+        // Doing it only for the first one is why the pad asked for a
+        // keyframe sixty times a second for ever: every later recovery
+        // point arrived mis-sequenced, it could not use any of them,
+        // and it kept asking.
+        // Asked for from outside: the next frame is the start of a
+        // stream as far as the pad is concerned, which is the only way
+        // to tell one that has lost the sequence to try again.
+        if (reinit_wanted_.exchange(false)) {
+          vstrm_inited = false;
+        }
+        if (is_idr && !vstrm_inited) {
+          vstrm_seqid = 0;
+        }
+        GenerateVstrmPackets(&vstrm_packets, chunks, timestamp, is_idr,
+                             &vstrm_inited, &vstrm_seqid);
+        // The synchronisation packet, which is NOT optional and is easy
+        // to leave out here because it has nothing to do with encoding.
+        // The loop sends one to the astrm port every pass, from this
+        // variable; a branch that never fills it in sends an empty
+        // packet sixty times a second, and the GamePad -- which takes
+        // its timebase from these -- shows nothing at all while the
+        // video packets arrive perfectly.
+        GenerateAstrmPacket(&astrm_packet, timestamp);
+        vstrm_inited = true;
+        if (getenv("DRC_STATS")) {
+          // The same counters the encoding path prints, because this
+          // path needs them more: there is no encoder here to blame, so
+          // "packets are going out" and "packets are not going out" is
+          // the whole diagnosis and nothing else in the process can say
+          // which it is.
+          static int dbg_frames = 0, dbg_idr = 0, dbg_pkts = 0;
+          static s32 dbg_t0 = 0;
+          dbg_frames++; if (is_idr) dbg_idr++;
+          dbg_pkts += (int)vstrm_packets.size();
+          if (dbg_t0 == 0) dbg_t0 = timestamp;
+          if ((s32)(timestamp - dbg_t0) > 1000000) {
+            fprintf(stderr, "[drc] pre-encoded: %d frames/s, %d IDR/s, %d pkts, "
+                            "%d resync\n",
+                    dbg_frames, dbg_idr, dbg_pkts, dbg_resync);
+            dbg_frames = 0; dbg_idr = 0; dbg_pkts = 0; dbg_resync = 0;
+            dbg_t0 = timestamp;
+          }
+        }
+        if (resync_requested) {
+          // Nothing here can answer it -- the encoder is elsewhere. The
+          // sender is told through its own protocol and restarts its
+          // encoder there; this only stops the request repeating.
+          resync_requested = false;
+        }
+      }
+    } else {
+
     LatchOnCurrentFrame(&encoding_frame);
     if (encoding_frame.size() > 0) {
       // The GamePad asks for a keyframe whenever it cannot decode. Answering
@@ -309,13 +454,100 @@ void VideoStreamer::InitEventsAndRun() {
       // lost the picture - 43 restarts over 21 seconds changed nothing there,
       // and only reassociating cleared it - but that is a different failure.
       send_idr = !vstrm_inited;
-      if (resync_restart && resync_requested && vstrm_inited &&
-          (!last_idr_valid ||
-           (s32)(timestamp - last_idr_ts) > resync_interval_us)) {
+      // An explicit ReinitStream(), which is not the same thing as the
+      // pad asking and must not be rate-limited like one.
+      //
+      // The caller asks for this when it has decided the pad is stuck,
+      // having already waited seconds to be sure, and it needs the WHOLE
+      // gesture rather than half of it: a fresh encoder, a rewound
+      // sequence, an IDR, and the init flag on the packets that carry
+      // it. Re-arming the flag alone -- which is all this used to do --
+      // announces a new stream and then hands the pad a P-frame
+      // predicting from pictures it does not have, which is exactly as
+      // undecodable as what it was already stuck on.
+      /*
+       * An explicit ReinitStream(), doing what a restart does here.
+       *
+       * The init flag alone was tried and is worse than nothing: it
+       * announces the start of a stream and then hands the pad a
+       * P-frame predicting from pictures it does not have, so there is
+       * nothing to start from and it stays stuck for good. A recovery
+       * point is expensive -- an intra frame does not fit DRH's five
+       * 1400-byte packets and gets split -- but a split frame it can
+       * sometimes use beats a frame it certainly cannot.
+       *
+       * Not rate-limited like a resync request: the caller has already
+       * waited seconds before asking.
+       */
+      /* The explicit ask, from a caller that has already waited seconds.
+       * Same answer, for the same reason: a sweep the pad can decode
+       * beats an IDR it cannot. */
+      /*
+       * The explicit ask, from a caller that has already waited seconds
+       * and watched the sweeps fail to help. THIS one restarts: a pad
+       * that has lost the sequence outright has nothing to sweep back
+       * into, and an IDR it may not manage to read is better than
+       * nothing it certainly cannot.
+       */
+      if (reinit_wanted_.exchange(false)) {
         encoder_->Restart();
         vstrm_inited = false;
         vstrm_seqid = 0;
         send_idr = true;
+      }
+      /*
+       * A keyframe request is answered with a REFRESH, not a restart.
+       *
+       * Restarting produces an IDR, and an IDR is the one frame this
+       * protocol cannot carry: five chunks, 1400 bytes each, and an
+       * intra frame of real video is many times that. Measured, it is
+       * not a poor answer but the cause of the failure -- the second an
+       * IDR went out took 28 packets for one image and drew 48 more
+       * requests, while every second without one sat at exactly 5
+       * packets and zero. The pad asked, was answered with something it
+       * could not read, and asked again.
+       *
+       * A sweep spreads the same intra macroblocks over the refresh
+       * period. Nothing is bigger than the frames around it, the
+       * picture repairs over half a second, and the loop never starts.
+       * It is also what the console does: libdrc's own note is that
+       * x264 under intra refresh never emits NAL_SLICE_IDR again after
+       * the first frame, which is only a problem if you insist on one.
+       */
+      /*
+       * A keyframe request is answered with a REFRESH SWEEP, not an IDR.
+       *
+       * Measured: the second an IDR goes out needs 28 packets for one
+       * image where five are allowed, and draws 48 further requests;
+       * the seconds around it sit at exactly 5 and zero. The pad asks,
+       * is answered with the one frame this protocol cannot carry, and
+       * asks again. A sweep spreads the same intra macroblocks over the
+       * refresh period, so nothing is bigger than its neighbours.
+       *
+       * The FIRST frame of a stream is still an IDR and must be: a
+       * sweep repairs a picture, it cannot provide one to a decoder
+       * that has never had anything. That is `send_idr = !vstrm_inited`
+       * above, and removing it is how this was tried once and left a
+       * black panel.
+       *
+       * Spaced by twice the sweep, not by the resync interval. x264's
+       * own note is that a refresh asked for while one is running only
+       * begins when that one ends -- so asking every half second, which
+       * is exactly how long a sweep takes, queues them nose to tail and
+       * the picture never settles.
+       */
+      const s32 sweep_us = 2 * (refresh_period * 1000000 / 60);
+      /* Asked for from outside, and spaced the same way: a caller that
+       * has waited three seconds still must not queue sweeps nose to
+       * tail, because one begun while another runs only starts when
+       * that one ends. */
+      const bool asked_sweep = sweep_wanted_.exchange(false);
+      if ((asked_sweep || (resync_restart && resync_requested)) && vstrm_inited &&
+          (!last_sweep_valid || (s32)(timestamp - last_sweep_ts) > sweep_us)) {
+        encoder_->Refresh();
+        last_sweep_ts = timestamp;
+        last_sweep_valid = true;
+        sweeps++;
       }
       if (send_idr) { last_idr_ts = timestamp; last_idr_valid = true; }
       const H264ChunkArray& chunks = encoder_->Encode(encoding_frame, send_idr);
@@ -341,10 +573,11 @@ void VideoStreamer::InitEventsAndRun() {
           strftime(hhmmss, sizeof hhmmss, "%H:%M:%S", localtime(&wall));
           fprintf(stderr,
                   "[drc] %s %d frames/s, %d IDR/s, %d pkts, max %d/img, "
-                  "%d resync, spread=%dus\n",
+                  "%d resync, %d sweeps, spread=%dus\n",
                   hhmmss, dbg_frames, dbg_idr, dbg_pkts, dbg_max, dbg_resync,
-                  tx_spread_us);
+                  sweeps, tx_spread_us);
           dbg_frames = 0; dbg_idr = 0; dbg_pkts = 0; dbg_resync = 0; dbg_max = 0;
+          sweeps = 0;
           dbg_t0 = timestamp;
         }
       }
@@ -353,6 +586,7 @@ void VideoStreamer::InitEventsAndRun() {
       vstrm_inited = true;
       resync_requested = false;
     }
+    }  /* the encoding path; the already-encoded one is above */
 
     timestamp = GetTimestamp();
     const s32 frame_interval = static_cast<s32>(1000000.0/59.94);

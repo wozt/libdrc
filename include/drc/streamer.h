@@ -90,6 +90,32 @@ class Streamer {
   // Faster: PushVidFrame requires pixel format conversion before encoding.
   void PushNativeVidFrame(std::vector<u8>* frame);
 
+  // A frame that is already in the pad's format: five DRH chunks packed
+  // one after another, with `sizes` giving each length, and `idr` saying
+  // what the frame actually came out as rather than what was asked for.
+  //
+  // For a sender that encodes with drc-x264 itself. It skips this
+  // library's encoder entirely, which is the second lossy pass and the
+  // whole cost of relaying somebody else's stream -- the packetiser
+  // never cared where the chunks came from. See the note in
+  // internal/video-streamer.h.
+  void PushEncodedVidFrame(const byte* data, const size_t* sizes, bool idr);
+
+  // Whether the pad has asked for a recovery point, clearing the ask.
+  // A sender on the pre-encoded path MUST poll this and answer it: this
+  // library cannot, the encoder being somewhere else entirely, and a
+  // pad that is asking is a pad showing nothing at all.
+  bool TakeResyncRequest();
+
+  // Re-arms the vstrm "init" flag, so the next frame tells the pad to
+  // re-initialise its decoder. Pair it with a recovery point -- see the
+  // note in internal/video-streamer.h.
+  void ReinitStream();
+
+  // The gentle recovery: a new intra refresh sweep, no IDR. See the note
+  // in internal/video-streamer.h for why the difference matters here.
+  void RequestSweep();
+
   // Expects 48KHz samples.
   void PushAudSamples(const std::vector<s16>& samples);
 

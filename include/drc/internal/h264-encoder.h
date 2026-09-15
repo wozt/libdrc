@@ -67,6 +67,25 @@ class H264Encoder {
   // way back.
   void Restart();
 
+  // Begin a new intra refresh sweep with the next frame, WITHOUT an IDR.
+  //
+  // This is what a recovery point costs here, and why Restart() is the
+  // wrong answer to packet loss: DRH gives each of five chunks a single
+  // 1400-byte packet, and an intra frame does not fit. Measured, the
+  // second an IDR goes out is the second the pad needs 28 packets for
+  // one image and asks for a keyframe 48 times; the seconds either side
+  // sit at exactly 5 packets and no requests at all.
+  //
+  // A sweep spreads the same intra macroblocks over the refresh period,
+  // so every frame stays inside the budget. x264's own documentation
+  // describes this as the tool for "interactive streaming where the
+  // client can tell the server that packet loss has occurred", which is
+  // this situation exactly.
+  //
+  // Restart() remains for the one case a sweep cannot answer: a decoder
+  // that has lost the sequence outright has nothing to sweep back into.
+  void Refresh();
+
  private:
   void ProcessNalUnit(x264_nal_t* nal);
   static void ProcessNalUnitTrampoline(x264_t* h, x264_nal_t* nal, void* arg);

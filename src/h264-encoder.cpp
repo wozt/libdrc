@@ -140,6 +140,12 @@ H264Encoder::~H264Encoder() {
   DestroyEncoder();
 }
 
+void H264Encoder::Refresh() {
+  if (encoder_) {
+    x264_encoder_intra_refresh(encoder_);
+  }
+}
+
 void H264Encoder::Restart() {
   DestroyEncoder();
   CreateEncoder();

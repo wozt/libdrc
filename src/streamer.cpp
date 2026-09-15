@@ -147,6 +147,23 @@ void Streamer::PushNativeVidFrame(std::vector<byte>* frame) {
   vid_streamer_->PushFrame(frame);
 }
 
+void Streamer::PushEncodedVidFrame(const byte* data, const size_t* sizes,
+                                   bool idr) {
+  vid_streamer_->PushEncodedFrame(data, sizes, idr);
+}
+
+bool Streamer::TakeResyncRequest() {
+  return vid_streamer_->TakeResyncRequest();
+}
+
+void Streamer::ReinitStream() {
+  vid_streamer_->ReinitStream();
+}
+
+void Streamer::RequestSweep() {
+  vid_streamer_->RequestSweep();
+}
+
 void Streamer::PushAudSamples(const std::vector<s16>& samples) {
   aud_streamer_->PushSamples(samples);
 }
